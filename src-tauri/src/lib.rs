@@ -139,7 +139,21 @@ mod media {
             GlobalSystemMediaTransportControlsSessionManager,
             GlobalSystemMediaTransportControlsSessionPlaybackStatus,
         },
+        Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
     };
+
+    struct MtaApartment;
+
+    impl MtaApartment {
+        fn initialize() -> Result<Self, String> {
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).map_err(|error| error.to_string())?; }
+            Ok(Self)
+        }
+    }
+
+    impl Drop for MtaApartment {
+        fn drop(&mut self) { unsafe { CoUninitialize(); } }
+    }
 
     #[link(name = "user32")]
     extern "system" {
@@ -147,7 +161,6 @@ mod media {
     }
 
     fn sessions() -> Result<Vec<GlobalSystemMediaTransportControlsSession>, String> {
-        windows::core::initialize_mta().map_err(|e| e.to_string())?;
         let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
             .map_err(|e| e.to_string())?
             .get()
@@ -178,6 +191,7 @@ mod media {
     }
 
     pub fn get_current_session() -> Result<MediaSession, String> {
+        let _apartment = MtaApartment::initialize()?;
         let Some(session) = select_session()? else {
             return Ok(MediaSession::default());
         };
@@ -195,11 +209,12 @@ mod media {
     }
 
     pub fn control(action: &str) -> Result<(), String> {
+        let _apartment = MtaApartment::initialize()?;
         let session = select_session()?.ok_or_else(|| "No active Windows media session".to_string())?;
         let operation = match action {
-            "play_pause" => session.TryTogglePlayPause(),
-            "next" => session.TrySkipNext(),
-            "previous" => session.TrySkipPrevious(),
+            "play_pause" => session.TryTogglePlayPauseAsync(),
+            "next" => session.TrySkipNextAsync(),
+            "previous" => session.TrySkipPreviousAsync(),
             _ => return Err("Unsupported media action".into()),
         };
         let accepted = operation.map_err(|e| e.to_string())?.get().map_err(|e| e.to_string())?;

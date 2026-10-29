@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
 const CREDENTIAL_TARGET: &str = "NEXUSOverlay.DiscordRPC";
 
@@ -191,8 +190,8 @@ mod windows_rpc {
     fn read_packet(pipe: &mut File) -> Result<(u32, Value), String> {
         let mut header = [0u8; 8];
         pipe.read_exact(&mut header).map_err(|e| e.to_string())?;
-        let opcode = u32::from_le_bytes(header[0..4].try_into().map_err(|e| e.to_string())?);
-        let length = u32::from_le_bytes(header[4..8].try_into().map_err(|e| e.to_string())?) as usize;
+        let opcode = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         if length > 2 * 1024 * 1024 { return Err("Discord RPC response exceeded the size limit".into()); }
         let mut body = vec![0; length];
         pipe.read_exact(&mut body).map_err(|e| e.to_string())?;
