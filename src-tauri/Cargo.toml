@@ -17,3 +17,10 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = "0.33"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.57", features = [
+    "Foundation",
+    "Media_Control",
+] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "form", "json", "native-tls"] }

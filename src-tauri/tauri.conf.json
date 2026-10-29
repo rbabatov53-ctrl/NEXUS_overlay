@@ -21,6 +21,7 @@
         "minHeight": 600,
         "center": true,
         "resizable": true,
+        "alwaysOnTop": true,
         "fullscreen": false,
         "decorations": false,
         "transparent": true,
@@ -38,7 +39,7 @@
       "msi"
     ],
     "resources": [
-      "PresentMon-2.6.0-x64.exe"
+      "PresentMon-2.5.1-x64.exe"
     ],
     "shortDescription": "Lightweight gaming overlay for Windows",
     "category": "Game"

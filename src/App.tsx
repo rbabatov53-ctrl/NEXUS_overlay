@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type MouseEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
-  Activity, AudioLines, BarChart3, Check, ChevronDown, CircleHelp, Cpu, Gamepad2,
+  Activity, AudioLines, BarChart3, Check, ChevronDown, CircleHelp, Cpu, Power,
   Globe2, Headphones, Home, Languages, Mic, MicOff, Monitor, Music2, Pause,
-  Play, Radio, Settings2, ShieldCheck, SkipBack, SkipForward, Volume2, X,
+  Play, Radio, Settings2, ShieldCheck, SkipBack, SkipForward, Volume2, Minus, Plus, X,
   PhoneOff, MemoryStick, Network, Keyboard,
 } from 'lucide-react';
 
@@ -40,6 +41,27 @@ type NetworkMetrics = {
   endpoint?: string | null;
   status?: NetworkStatus;
   samples?: number;
+};
+
+type MediaSession = {
+  title: string | null;
+  artist: string | null;
+  source: string | null;
+  playing: boolean;
+};
+
+type DiscordVoiceStatus = {
+  connected: boolean;
+  channel_name: string | null;
+  self_mute: boolean;
+  self_deaf: boolean;
+  participant_count: number;
+};
+
+type DiscordConfig = {
+  app_id: string | null;
+  redirect_uri: string | null;
+  configured: boolean;
 };
 
 const navItems: { id: Page; label: string; icon: typeof Home }[] = [
@@ -79,18 +101,24 @@ function Metric({
 
 export default function App() {
   const [page, setPage] = useState<Page>('home');
-  const [playing, setPlaying] = useState(false);
-  const [muted, setMuted] = useState(false);
+  const [mediaSession, setMediaSession] = useState<MediaSession | null>(null);
+  const [mediaError, setMediaError] = useState<string | null>(null);
   const [language, setLanguage] = useState<'Русский' | 'English'>('Русский');
-  const [compact, setCompact] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [hotkey, setHotkey] = useState(
-    () => localStorage.getItem('nexus-hotkey') || 'Insert',
-  );
-  const [recordingHotkey, setRecordingHotkey] = useState(false);
+  const [startOnLogin, setStartOnLogin] = useState(false);
+  const [startupError, setStartupError] = useState<string | null>(null);
+  const hotkey = 'Insert';
   const [metrics, setMetrics] = useState<PcMetrics | null>(null);
   const [gameMetrics, setGameMetrics] = useState<GameMetrics | null>(null);
   const [networkMetrics, setNetworkMetrics] = useState<NetworkMetrics | null>(null);
+  const [discordConfig, setDiscordConfig] = useState<DiscordConfig | null>(null);
+  const [discordAppId, setDiscordAppId] = useState('');
+  const [discordSecret, setDiscordSecret] = useState('');
+  const [discordRedirect, setDiscordRedirect] = useState('http://localhost');
+  const [discordStatus, setDiscordStatus] = useState<DiscordVoiceStatus | null>(null);
+  const [discordAuthorized, setDiscordAuthorized] = useState(false);
+  const [discordMessage, setDiscordMessage] = useState<string | null>(null);
+  const [discordBusy, setDiscordBusy] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -108,7 +136,7 @@ export default function App() {
 
     const timer = window.setInterval(() => {
       void updateMetrics();
-    }, 2000);
+    }, 4000);
 
     return () => {
       active = false;
@@ -132,7 +160,7 @@ export default function App() {
 
     const timer = window.setInterval(() => {
       void updateGameMetrics();
-    }, 500);
+    }, 1000);
 
     return () => {
       active = false;
@@ -156,7 +184,7 @@ export default function App() {
 
     const timer = window.setInterval(() => {
       void updateNetworkMetrics();
-    }, 1000);
+    }, 2000);
 
     return () => {
       active = false;
@@ -164,44 +192,177 @@ export default function App() {
     };
   }, []);
 
+
   useEffect(() => {
-    if (!recordingHotkey) return;
+    void invoke<boolean>('get_start_on_login')
+      .then(setStartOnLogin)
+      .catch(() => setStartOnLogin(false));
+  }, []);
 
-    const onKeyDown = (event: KeyboardEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
+  const updateStartOnLogin = async () => {
+    const next = !startOnLogin;
+    try {
+      await invoke('set_start_on_login', { enabled: next });
+      setStartOnLogin(next);
+      setStartupError(null);
+    } catch (error) {
+      setStartupError(String(error));
+    }
+  };
 
-      if (event.key === 'Escape') {
-        setRecordingHotkey(false);
-        return;
+  useEffect(() => {
+    let active = true;
+    void invoke<DiscordConfig>('get_discord_config').then(async config => {
+      if (!active) return;
+      setDiscordConfig(config);
+      if (config.app_id) setDiscordAppId(config.app_id);
+      if (config.redirect_uri) setDiscordRedirect(config.redirect_uri);
+      if (!config.configured) return;
+      try {
+        const voice = await invoke<DiscordVoiceStatus>('get_discord_voice_status');
+        if (active) {
+          setDiscordStatus(voice);
+          setDiscordAuthorized(true);
+          setDiscordMessage(null);
+        }
+      } catch (error) {
+        if (active) {
+          setDiscordAuthorized(false);
+          setDiscordMessage(String(error));
+        }
       }
+    }).catch(error => {
+      if (active) setDiscordMessage(String(error));
+    });
+    return () => { active = false; };
+  }, []);
 
-      if (['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) return;
+  useEffect(() => {
+    if (!discordAuthorized) return;
+    const timer = window.setInterval(() => {
+      void invoke<DiscordVoiceStatus>('get_discord_voice_status')
+        .then(setDiscordStatus)
+        .catch(error => {
+          setDiscordAuthorized(false);
+          setDiscordMessage(String(error));
+        });
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [discordAuthorized]);
 
-      const modifiers = [
-        event.ctrlKey ? 'Ctrl' : '',
-        event.altKey ? 'Alt' : '',
-        event.shiftKey ? 'Shift' : '',
-        event.metaKey ? 'Win' : '',
-      ].filter(Boolean);
+  const saveDiscordCredentials = async () => {
+    setDiscordBusy(true);
+    try {
+      await invoke('save_discord_credentials', {
+        appId: discordAppId,
+        clientSecret: discordSecret,
+        redirectUri: discordRedirect,
+      });
+      setDiscordSecret('');
+      setDiscordConfig({ app_id: discordAppId, redirect_uri: discordRedirect, configured: true });
+      setDiscordMessage(label('Credentials сохранены в Windows Credential Manager.', 'Credentials saved in Windows Credential Manager.'));
+    } catch (error) {
+      setDiscordMessage(String(error));
+    } finally {
+      setDiscordBusy(false);
+    }
+  };
 
-      const keyName =
-        event.key === ' '
-          ? 'Space'
-          : event.key.length === 1
-            ? event.key.toUpperCase()
-            : event.key;
+  const connectDiscord = async () => {
+    setDiscordBusy(true);
+    setDiscordMessage(label('Подтвердите подключение в окне Discord…', 'Approve the connection in Discord…'));
+    try {
+      const voice = await invoke<DiscordVoiceStatus>('connect_discord');
+      setDiscordStatus(voice);
+      setDiscordAuthorized(true);
+      setDiscordMessage(label('Discord RPC подключён.', 'Discord RPC connected.'));
+    } catch (error) {
+      setDiscordAuthorized(false);
+      setDiscordMessage(String(error));
+    } finally {
+      setDiscordBusy(false);
+    }
+  };
 
-      const nextHotkey = [...modifiers, keyName].join(' + ');
+  const controlDiscord = async (action: string) => {
+    setDiscordBusy(true);
+    try {
+      const voice = await invoke<DiscordVoiceStatus>('control_discord', { action });
+      setDiscordStatus(voice);
+      setDiscordMessage(null);
+    } catch (error) {
+      setDiscordMessage(String(error));
+    } finally {
+      setDiscordBusy(false);
+    }
+  };
 
-      setHotkey(nextHotkey);
-      localStorage.setItem('nexus-hotkey', nextHotkey);
-      setRecordingHotkey(false);
+  const disconnectDiscord = async () => {
+    setDiscordBusy(true);
+    try {
+      await invoke('disconnect_discord');
+      setDiscordStatus(null);
+      setDiscordAuthorized(false);
+      setDiscordMessage(label('Discord отключён.', 'Discord disconnected.'));
+    } catch (error) {
+      setDiscordMessage(String(error));
+    } finally {
+      setDiscordBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    let active = true;
+    const refreshMedia = async () => {
+      try {
+        const result = await invoke<MediaSession>('get_media_session');
+        if (active) {
+          setMediaSession(result);
+          setMediaError(null);
+        }
+      } catch (error) {
+        if (active) setMediaError(String(error));
+      }
     };
+    void refreshMedia();
+    const timer = window.setInterval(() => void refreshMedia(), 2500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
 
-    window.addEventListener('keydown', onKeyDown, true);
-    return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [recordingHotkey]);
+  const sendMediaCommand = async (action: string) => {
+    try {
+      await invoke('control_media', { action });
+      setMediaError(null);
+      window.setTimeout(() => {
+        void invoke<MediaSession>('get_media_session').then(setMediaSession).catch(() => undefined);
+      }, 350);
+    } catch (error) {
+      setMediaError(String(error));
+    }
+  };
+
+  const changeSystemVolume = async (action: string) => {
+    try {
+      await invoke('adjust_system_volume', { action });
+      setMediaError(null);
+    } catch (error) {
+      setMediaError(String(error));
+    }
+  };
+
+  const startWindowDrag = (event: MouseEvent<HTMLElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest('button, a, input, select, textarea, [data-no-drag]')) return;
+    try {
+      void getCurrentWindow().startDragging().catch(() => undefined);
+    } catch { /* Native window APIs are absent in the browser-only preview. */ }
+  };
+
+  const hideOverlay = () => {
+    try {
+      void getCurrentWindow().hide().catch(() => undefined);
+    } catch { /* Native window APIs are absent in the browser-only preview. */ }
+  };
 
   const english = language === 'English';
   const label = (ru: string, en: string) => english ? en : ru;
@@ -345,7 +506,7 @@ export default function App() {
   })();
 
   return (
-    <main className={compact ? 'app compact' : 'app'}>
+    <main className="app" onMouseDown={startWindowDrag}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">N</div>
@@ -440,8 +601,8 @@ export default function App() {
             </button>
             <button
               className="icon-button"
-              aria-label="Close preview"
-              onClick={() => setCompact(v => !v)}
+              aria-label="Hide overlay · press Insert to show"
+              onClick={hideOverlay}
             >
               <X size={17} />
             </button>
@@ -562,9 +723,9 @@ export default function App() {
                     <Music2 size={24} />
                   </div>
                   <div className="track-info">
-                    <strong>{label('Нет активного трека', 'No active track')}</strong>
+                    <strong>{mediaSession?.title || label('Нет активного трека', 'No active track')}</strong>
                     <span>
-                      {label(
+                      {mediaSession?.artist || mediaSession?.source || label(
                         'Запусти музыку в поддерживаемом плеере',
                         'Start music in a supported player',
                       )}
@@ -576,31 +737,40 @@ export default function App() {
                 </div>
 
                 <div className="player-controls">
-                  <button className="icon-button" aria-label="Previous">
+                  <button className="icon-button" aria-label="Decrease system volume" title="Volume down" onClick={() => void changeSystemVolume('down')}>
+                    <Minus size={15} />
+                  </button>
+                  <button className="icon-button" aria-label="Previous" title="Previous track" onClick={() => void sendMediaCommand('previous')}>
                     <SkipBack size={16} />
                   </button>
                   <button
                     className="play-button"
-                    aria-label={playing ? 'Pause' : 'Play'}
-                    onClick={() => setPlaying(v => !v)}
+                    aria-label={mediaSession?.playing ? 'Pause' : 'Play'}
+                    title={mediaSession?.playing ? 'Pause' : 'Play'}
+                    onClick={() => void sendMediaCommand('play_pause')}
                   >
-                    {playing ? <Pause size={17} /> : <Play size={17} />}
+                    {mediaSession?.playing ? <Pause size={17} /> : <Play size={17} />}
                   </button>
-                  <button className="icon-button" aria-label="Next">
+                  <button className="icon-button" aria-label="Next" title="Next track" onClick={() => void sendMediaCommand('next')}>
                     <SkipForward size={16} />
                   </button>
-                  <button className="icon-button favorite" aria-label="Volume">
+                  <button className="icon-button" aria-label="Mute or unmute system volume" title="Mute or unmute system volume" onClick={() => void changeSystemVolume('mute')}>
                     <Volume2 size={16} />
+                  </button>
+                  <button className="icon-button favorite" aria-label="Increase system volume" title="Volume up" onClick={() => void changeSystemVolume('up')}>
+                    <Plus size={15} />
                   </button>
                 </div>
 
                 <div className="notice">
                   <CircleHelp size={14} />
                   <span>
-                    {label(
-                      'Управление станет доступно после подключения медиасессии',
-                      'Controls activate when a media session is detected',
-                    )}
+                    {mediaError || (mediaSession?.source
+                      ? `${label('Медиасессия Windows', 'Windows media session')} · ${mediaSession.source}`
+                      : label(
+                          'Ожидание медиасессии Windows · SoundCloud работает через системные элементы управления',
+                          'Waiting for a Windows media session · SoundCloud uses the system media controls',
+                        ))}
                   </span>
                 </div>
               </section>
@@ -623,27 +793,24 @@ export default function App() {
                   <div className="call-wave">
                     <Radio size={22} />
                   </div>
-                  <strong>{label('Нет активного звонка', 'No active call')}</strong>
+                  <strong>{discordStatus?.connected ? discordStatus.channel_name || label('Активный звонок', 'Active call') : label('Нет активного звонка', 'No active call')}</strong>
                   <span>
-                    {label(
-                      'Когда звонок активен, здесь появятся кнопки управления',
-                      'Call controls will appear here when a call is active',
-                    )}
+                    {discordAuthorized
+                      ? discordStatus?.connected
+                        ? label(`${discordStatus.participant_count} участников`, `${discordStatus.participant_count} participants`)
+                        : label('RPC подключён · голосовой канал не выбран', 'RPC connected · no voice channel selected')
+                      : discordMessage || label('Подключите официальный Discord RPC в разделе Discord', 'Connect official Discord RPC in the Discord section')}
                   </span>
                 </div>
 
                 <div className="call-controls">
-                  <button
-                    className={`round-control ${muted ? 'selected' : ''}`}
-                    onClick={() => setMuted(v => !v)}
-                    aria-label="Toggle microphone"
-                  >
-                    {muted ? <MicOff size={17} /> : <Mic size={17} />}
+                  <button className={`round-control ${discordStatus?.self_mute ? 'selected' : ''}`} aria-label={label('Заглушить микрофон', 'Mute microphone')} title={label('Переключить микрофон Discord', 'Toggle Discord microphone')} disabled={!discordAuthorized || discordBusy} onClick={() => void controlDiscord('mute')}>
+                    {discordStatus?.self_mute ? <MicOff size={17} /> : <Mic size={17} />}
                   </button>
-                  <button className="round-control" aria-label="Deafen">
+                  <button className={`round-control ${discordStatus?.self_deaf ? 'selected' : ''}`} aria-label={label('Заглушить наушники', 'Deafen')} title={label('Переключить звук Discord', 'Toggle Discord audio')} disabled={!discordAuthorized || discordBusy} onClick={() => void controlDiscord('deafen')}>
                     <Headphones size={17} />
                   </button>
-                  <button className="round-control hangup" aria-label="End call">
+                  <button className="round-control hangup" aria-label={label('Завершить звонок', 'Leave voice channel')} title={label('Покинуть голосовой канал Discord', 'Leave Discord voice channel')} disabled={!discordAuthorized || !discordStatus?.connected || discordBusy} onClick={() => void controlDiscord('leave')}>
                     <PhoneOff size={17} />
                   </button>
                 </div>
@@ -750,58 +917,79 @@ export default function App() {
 
         {page === 'music' && (
           <section className="panel page-panel">
-            <div className="panel-title">
-              <div className="service-icon soundcloud">
-                <AudioLines size={18} />
+              <div className="panel-title">
+                <div className="service-icon soundcloud">
+                  <AudioLines size={18} />
+                </div>
+                <div>
+                  <h3>SoundCloud</h3>
+                  <p>{label('Медиасессии Windows · без доступа к аккаунту', 'Windows media sessions · no account access')}</p>
+                </div>
               </div>
-              <div>
-                <h3>SoundCloud</h3>
-                <p>
-                  {label(
-                    'Автоопределение активного плеера',
-                    'Automatic active-player detection',
-                  )}
-                </p>
-              </div>
-            </div>
             <div className="empty-state">
               <Music2 size={30} />
-              <strong>
-                {label(
-                  'Медиаплеер пока не подключён',
-                  'No media player connected yet',
-                )}
-              </strong>
+              <strong>{mediaSession?.title || label('Автоопределение медиаплеера', 'Automatic media-player detection')}</strong>
               <span>
-                {label(
-                  'Сначала подключим системные медиасессии Windows, затем проверим доступные возможности SoundCloud API.',
-                  'We will connect Windows media sessions first, then verify SoundCloud API capabilities.',
-                )}
+                {mediaSession?.source || mediaSession?.title
+                  ? `${mediaSession.artist || ''}${mediaSession.source ? ` · ${mediaSession.source}` : ''}`
+                  : label(
+                      'NEXUS читает только медиасессию Windows (SMTC). Если браузер или приложение SoundCloud публикует её, трек и транспортные кнопки появятся автоматически. Пароль и cookie не запрашиваются.',
+                      'NEXUS reads only the Windows media session (SMTC). When a SoundCloud browser/app publishes one, track metadata and transport controls appear automatically. No password or cookies are requested.',
+                    )}
               </span>
+              <a className="official-link" href="https://soundcloud.com" target="_blank" rel="noreferrer">
+                {label('Открыть SoundCloud', 'Open SoundCloud')} ↗
+              </a>
+              <a className="text-link" href="https://developers.soundcloud.com/docs/api/guide" target="_blank" rel="noreferrer">
+                {label('Официальная документация API', 'Official API documentation')} ↗
+              </a>
             </div>
           </section>
         )}
 
         {page === 'discord' && (
-          <section className="panel page-panel">
+          <section className="panel page-panel discord-setup">
             <div className="panel-title">
-              <div className="service-icon discord-icon">
-                <Headphones size={18} />
-              </div>
+              <div className="service-icon discord-icon"><Headphones size={18} /></div>
               <div>
-                <h3>Discord</h3>
-                <p>{label('Управление активным звонком', 'Active call controls')}</p>
+                <h3>Discord RPC</h3>
+                <p>{label('Официальный локальный RPC через IPC', 'Official local RPC over IPC')}</p>
               </div>
-            </div>
-            <div className="empty-state">
-              <Headphones size={30} />
-              <strong>{label('Ожидание интеграции', 'Integration pending')}</strong>
-              <span>
-                {label(
-                  'Начнём с доступных официальных способов отображать звонок, управлять микрофоном и завершать вызов.',
-                  'We will start with officially supported call status, microphone and hang-up controls.',
-                )}
+              <span className={`setting-badge ${discordAuthorized ? 'discord-connected' : ''}`}>
+                {discordAuthorized ? label('ПОДКЛЮЧЕНО', 'CONNECTED') : label('НЕ ПОДКЛЮЧЕНО', 'NOT CONNECTED')}
               </span>
+            </div>
+            <p className="discord-help">
+              {label(
+                'Создайте приложение в Discord Developer Portal. Добавьте redirect URI ниже в OAuth2 и запросите доступ RPC для приложения/тестера. Клиентский секрет сохраняется только в Windows Credential Manager; NEXUS его не отправляет никуда, кроме официального Discord OAuth token endpoint.',
+                'Create an app in Discord Developer Portal. Register the redirect URI below under OAuth2 and ensure RPC access for the app/tester. The client secret is stored only in Windows Credential Manager and is sent only to Discord’s official OAuth token endpoint.',
+              )}
+            </p>
+            <div className="discord-form">
+              <label>{label('Application ID', 'Application ID')}
+                <input value={discordAppId} onChange={event => setDiscordAppId(event.target.value)} placeholder="123456789012345678" inputMode="numeric" autoComplete="off" />
+              </label>
+              <label>{label('Client Secret', 'Client Secret')}
+                <input type="password" value={discordSecret} onChange={event => setDiscordSecret(event.target.value)} placeholder={discordConfig?.configured ? label('Сохранён · введите новый для замены', 'Saved · enter a new one to replace') : '••••••••••••••••'} autoComplete="new-password" />
+              </label>
+              <label>{label('Redirect URI (точно как в Developer Portal)', 'Redirect URI (must match Developer Portal)')}
+                <input value={discordRedirect} onChange={event => setDiscordRedirect(event.target.value)} placeholder="http://localhost" autoComplete="url" />
+              </label>
+            </div>
+            <div className="discord-actions">
+              <button className="select-button" onClick={() => void saveDiscordCredentials()} disabled={discordBusy || !discordAppId || !discordSecret || !discordRedirect}>
+                {label('Сохранить локально', 'Save locally')}
+              </button>
+              <button className="official-link discord-connect" onClick={() => void connectDiscord()} disabled={discordBusy || !discordConfig?.configured}>
+                {discordBusy ? label('ОЖИДАНИЕ…', 'WAITING…') : label('Подключить Discord', 'Connect Discord')}
+              </button>
+              {discordAuthorized && <button className="select-button" onClick={() => void disconnectDiscord()} disabled={discordBusy}>{label('Отключить', 'Disconnect')}</button>}
+            </div>
+            {discordMessage && <div className="notice settings-notice"><CircleHelp size={14} /><span>{discordMessage}</span></div>}
+            {discordStatus?.connected && <div className="discord-live-state"><span className="dot" /><strong>{discordStatus.channel_name || label('Активный голосовой канал', 'Active voice channel')}</strong><span>{label(`${discordStatus.participant_count} участников`, `${discordStatus.participant_count} participants`)}</span></div>}
+            <div className="discord-doc-links">
+              <a className="text-link" href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">{label('Создать приложение Discord', 'Create a Discord application')} ↗</a>
+              <a className="text-link" href="https://discord.com/developers/docs/topics/rpc" target="_blank" rel="noreferrer">{label('Документация RPC', 'RPC documentation')} ↗</a>
             </div>
           </section>
         )}
@@ -827,25 +1015,13 @@ export default function App() {
                   {label('Горячая клавиша оверлея', 'Overlay hotkey')}
                 </strong>
                 <span>
-                  {recordingHotkey
-                    ? label(
-                        'Нажми нужную клавишу или сочетание · Esc — отмена',
-                        'Press a key or shortcut · Esc to cancel',
-                      )
-                    : label(
-                        'Выбери любое сочетание клавиш',
-                        'Choose any key or shortcut',
-                      )}
+                  {label(
+                    'Глобальная клавиша Windows · повторное нажатие скрывает или показывает оверлей',
+                    'Windows global hotkey · press again to hide or show the overlay',
+                  )}
                 </span>
               </div>
-              <button
-                className={`hotkey-button ${recordingHotkey ? 'listening' : ''}`}
-                onClick={() => setRecordingHotkey(true)}
-              >
-                {recordingHotkey
-                  ? label('ОЖИДАНИЕ…', 'LISTENING…')
-                  : hotkey}
-              </button>
+              <kbd className="setting-badge">{hotkey}</kbd>
             </div>
 
             <div className="setting-row">
@@ -873,22 +1049,22 @@ export default function App() {
             </div>
 
             <div className="setting-row">
-              <div className="setting-icon">
-                <Gamepad2 size={18} />
-              </div>
+              <div className="setting-icon"><Power size={18} /></div>
               <div className="setting-copy">
-                <strong>
-                  {label(
-                    'Автозапуск с лаунчерами',
-                    'Launch with game launchers',
-                  )}
-                </strong>
-                <span>Steam · Epic Games · TLauncher · VK Play</span>
+                <strong>{label('Фоновый наблюдатель игр', 'Background game watcher')}</strong>
+                <span>{label('Запускать NEXUS скрыто при входе в Windows; Insert показывает оверлей', 'Start NEXUS hidden at Windows sign-in; Insert reveals the overlay')}</span>
               </div>
-              <span className="setting-badge">
-                {label('Настроим', 'Planned')}
-              </span>
+              <button
+                className={`startup-toggle ${startOnLogin ? 'enabled' : ''}`}
+                onClick={() => void updateStartOnLogin()}
+                role="switch"
+                aria-checked={startOnLogin}
+                aria-label={label('Фоновый запуск с Windows', 'Start background watcher with Windows')}
+              >
+                <span />
+              </button>
             </div>
+            {startupError && <div className="notice settings-notice"><CircleHelp size={14} /><span>{startupError}</span></div>}
 
             <div className="setting-row">
               <div className="setting-icon">

@@ -6,7 +6,8 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   server: {
-    host: '127.0.0.1',
+    host: '0.0.0.0',
+    allowedHosts: ['.e2b.app'],
     port: 1420,
     strictPort: true,
     watch: {
