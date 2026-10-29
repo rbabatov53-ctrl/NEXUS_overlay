@@ -13,8 +13,8 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -22,7 +22,20 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
       - name: Build NSIS installer
-        run: npm run build:windows
+        shell: pwsh
+        run: |
+          & npm run build:windows *> build.log
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -ne 0) {
+            $diagnostics = Select-String -Path build.log -Pattern 'error|failed|cannot|could not|unrecognized|not found' -Context 1, 2 | ForEach-Object { $_.ToString() }
+            if (-not $diagnostics) { $diagnostics = Get-Content build.log -Tail 80 }
+            $message = ($diagnostics -join "`n")
+            if ($message.Length -gt 5000) { $message = $message.Substring($message.Length - 5000) }
+            $message = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows build diagnostics::$message"
+            Get-Content build.log -Tail 80
+          }
+          exit $buildExit
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
