@@ -146,7 +146,7 @@ mod media {
 
     impl MtaApartment {
         fn initialize() -> Result<Self, String> {
-            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).map_err(|error| error.to_string())?; }
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(|error| error.to_string())?; }
             Ok(Self)
         }
     }
