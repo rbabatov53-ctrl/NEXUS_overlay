@@ -9,8 +9,285 @@ use std::{
     thread,
     time::Duration,
 };
+#[cfg(windows)]
+use std::{collections::HashMap, sync::OnceLock, time::Instant};
 use sysinfo::System;
 use tauri::{Manager, State};
+
+mod discord;
+
+#[derive(Serialize, Clone, Default)]
+struct MediaSession {
+    title: Option<String>,
+    artist: Option<String>,
+    source: Option<String>,
+    playing: bool,
+}
+
+#[tauri::command]
+fn get_media_session() -> MediaSession {
+    #[cfg(windows)]
+    {
+        return media::get_current_session().unwrap_or_default();
+    }
+    #[cfg(not(windows))]
+    {
+        MediaSession::default()
+    }
+}
+
+#[tauri::command]
+fn control_media(action: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        return media::control(&action);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = action;
+        Err("Windows media controls are available in the Windows app".into())
+    }
+}
+
+#[tauri::command]
+fn get_start_on_login() -> bool {
+    #[cfg(windows)]
+    {
+        return std::process::Command::new("reg.exe")
+            .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "NEXUSOverlay"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+#[tauri::command]
+fn set_start_on_login(enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        let result = if enabled {
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            let command = format!("\"{}\" --background", executable.display());
+            std::process::Command::new("reg.exe")
+                .args(["add", key, "/v", "NEXUSOverlay", "/t", "REG_SZ", "/d", &command, "/f"])
+                .status()
+        } else {
+            std::process::Command::new("reg.exe")
+                .args(["delete", key, "/v", "NEXUSOverlay", "/f"])
+                .status()
+        };
+        return match result {
+            Ok(status) if status.success() => Ok(()),
+            Ok(_) => Err("Windows could not update the per-user startup entry".into()),
+            Err(error) => Err(error.to_string()),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("Background game watcher is available in the Windows app".into())
+    }
+}
+
+#[tauri::command]
+fn adjust_system_volume(action: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        return media::adjust_volume(&action);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = action;
+        Err("System volume control is available in the Windows app".into())
+    }
+}
+
+#[tauri::command]
+fn get_discord_config() -> discord::ConfigSummary { discord::summary() }
+
+#[tauri::command]
+fn save_discord_credentials(app_id: String, client_secret: String, redirect_uri: String) -> Result<(), String> {
+    discord::save(app_id, client_secret, redirect_uri)
+}
+
+#[tauri::command]
+fn connect_discord() -> Result<discord::VoiceStatus, String> { discord::connect() }
+
+#[tauri::command]
+fn get_discord_voice_status() -> Result<discord::VoiceStatus, String> { discord::status() }
+
+#[tauri::command]
+fn control_discord(action: String) -> Result<discord::VoiceStatus, String> { discord::control(&action) }
+
+#[tauri::command]
+fn disconnect_discord() -> Result<(), String> { discord::disconnect() }
+
+#[tauri::command]
+fn forget_discord_credentials() -> Result<(), String> { discord::forget() }
+
+#[cfg(windows)]
+mod media {
+    use super::MediaSession;
+    use windows::{
+        Media::Control::{
+            GlobalSystemMediaTransportControlsSession,
+            GlobalSystemMediaTransportControlsSessionManager,
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+        },
+        Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
+    };
+
+    struct MtaApartment;
+
+    impl MtaApartment {
+        fn initialize() -> Result<Self, String> {
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(|error| error.to_string())?; }
+            Ok(Self)
+        }
+    }
+
+    impl Drop for MtaApartment {
+        fn drop(&mut self) { unsafe { CoUninitialize(); } }
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn keybd_event(vk: u8, scan: u8, flags: u32, extra_info: usize);
+    }
+
+    fn sessions() -> Result<Vec<GlobalSystemMediaTransportControlsSession>, String> {
+        let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .map_err(|e| e.to_string())?
+            .get()
+            .map_err(|e| e.to_string())?;
+        let list = manager.GetSessions().map_err(|e| e.to_string())?;
+        let count = list.Size().map_err(|e| e.to_string())?;
+        let mut result = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            if let Ok(session) = list.GetAt(index) {
+                result.push(session);
+            }
+        }
+        Ok(result)
+    }
+
+    fn select_session() -> Result<Option<GlobalSystemMediaTransportControlsSession>, String> {
+        let sessions = sessions()?;
+        for session in &sessions {
+            if let Ok(info) = session.GetPlaybackInfo() {
+                if info.PlaybackStatus().ok()
+                    == Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
+                {
+                    return Ok(Some(session.clone()));
+                }
+            }
+        }
+        Ok(sessions.into_iter().next())
+    }
+
+    pub fn get_current_session() -> Result<MediaSession, String> {
+        let _apartment = MtaApartment::initialize()?;
+        let Some(session) = select_session()? else {
+            return Ok(MediaSession::default());
+        };
+        let props = session.TryGetMediaPropertiesAsync()
+            .map_err(|e| e.to_string())?
+            .get()
+            .map_err(|e| e.to_string())?;
+        let title = props.Title().ok().map(|value| value.to_string_lossy()).filter(|s| !s.is_empty());
+        let artist = props.Artist().ok().map(|value| value.to_string_lossy()).filter(|s| !s.is_empty());
+        let source = session.SourceAppUserModelId().ok().map(|value| value.to_string_lossy());
+        let playing = session.GetPlaybackInfo().ok()
+            .and_then(|info| info.PlaybackStatus().ok())
+            == Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
+        Ok(MediaSession { title, artist, source, playing })
+    }
+
+    pub fn control(action: &str) -> Result<(), String> {
+        let _apartment = MtaApartment::initialize()?;
+        let session = select_session()?.ok_or_else(|| "No active Windows media session".to_string())?;
+        let operation = match action {
+            "play_pause" => session.TryTogglePlayPauseAsync(),
+            "next" => session.TrySkipNextAsync(),
+            "previous" => session.TrySkipPreviousAsync(),
+            _ => return Err("Unsupported media action".into()),
+        };
+        let accepted = operation.map_err(|e| e.to_string())?.get().map_err(|e| e.to_string())?;
+        if accepted { Ok(()) } else { Err("The active player declined this action".into()) }
+    }
+
+    pub fn adjust_volume(action: &str) -> Result<(), String> {
+        let key = match action {
+            "up" => 0xAF,
+            "down" => 0xAE,
+            "mute" => 0xAD,
+            _ => return Err("Unsupported volume action".into()),
+        };
+        unsafe {
+            keybd_event(key, 0, 0, 0);
+            keybd_event(key, 0, 0x0002, 0);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct HotkeyPoint { x: i32, y: i32 }
+
+#[cfg(windows)]
+#[repr(C)]
+struct HotkeyMessage {
+    hwnd: *mut std::ffi::c_void,
+    message: u32,
+    w_param: usize,
+    l_param: isize,
+    time: u32,
+    point: HotkeyPoint,
+    l_private: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn RegisterHotKey(hwnd: *mut std::ffi::c_void, id: i32, modifiers: u32, key: u32) -> i32;
+    fn UnregisterHotKey(hwnd: *mut std::ffi::c_void, id: i32) -> i32;
+    fn GetMessageW(message: *mut HotkeyMessage, hwnd: *mut std::ffi::c_void, min: u32, max: u32) -> i32;
+}
+
+#[cfg(windows)]
+fn register_insert_hotkey(app: tauri::AppHandle) {
+    use std::{mem::zeroed, ptr};
+
+    thread::spawn(move || unsafe {
+        const HOTKEY_ID: i32 = 0x4E58;
+        const WM_HOTKEY: u32 = 0x0312;
+        const MOD_NOREPEAT: u32 = 0x4000;
+        const VK_INSERT: u32 = 0x2D;
+        if RegisterHotKey(ptr::null_mut(), HOTKEY_ID, MOD_NOREPEAT, VK_INSERT) == 0 {
+            eprintln!("Не удалось зарегистрировать глобальную клавишу Insert");
+            return;
+        }
+        loop {
+            let mut message: HotkeyMessage = zeroed();
+            if GetMessageW(&mut message, ptr::null_mut(), 0, 0) <= 0 { break; }
+            if message.message == WM_HOTKEY && message.w_param == HOTKEY_ID as usize {
+                if let Some(window) = app.get_webview_window("main") {
+                    match window.is_visible() {
+                        Ok(true) => { let _ = window.hide(); }
+                        _ => { let _ = window.show(); let _ = window.set_focus(); }
+                    }
+                }
+            }
+        }
+        let _ = UnregisterHotKey(ptr::null_mut(), HOTKEY_ID);
+    });
+}
 
 const NETWORK_WINDOW_SIZE: usize = 20;
 const MIN_SAMPLES_FOR_FAILURE_LOSS: usize = 2;
@@ -65,6 +342,10 @@ struct NetworkState {
     metrics: Arc<Mutex<NetworkMetrics>>,
 }
 
+struct PcState {
+    system: Mutex<System>,
+}
+
 #[tauri::command]
 fn get_game_metrics(state: State<'_, GameState>) -> GameMetrics {
     state
@@ -84,12 +365,10 @@ fn get_network_metrics(state: State<'_, NetworkState>) -> NetworkMetrics {
 }
 
 #[tauri::command]
-fn get_pc_metrics() -> PcMetrics {
-    let mut system = System::new_all();
+fn get_pc_metrics(state: State<'_, PcState>) -> PcMetrics {
+    let mut system = state.system.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     system.refresh_cpu_usage();
-
-    thread::sleep(Duration::from_millis(250));
-    system.refresh_cpu_usage();
+    system.refresh_memory();
 
     let ram_total = system.total_memory() / 1024 / 1024;
     let ram_available = system.available_memory() / 1024 / 1024;
@@ -130,7 +409,7 @@ fn get_pc_metrics() -> PcMetrics {
 }
 
 fn find_presentmon() -> Option<PathBuf> {
-    let filename = "PresentMon-2.6.0-x64.exe";
+    let filename = "PresentMon-2.5.1-x64.exe";
 
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(parent) = exe_path.parent() {
@@ -159,7 +438,71 @@ fn find_presentmon() -> Option<PathBuf> {
     None
 }
 
-fn is_game_candidate(application: &str) -> bool {
+#[cfg(windows)]
+fn has_game_sized_window_uncached(process_id: u32) -> bool {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
+    struct Search { pid: u32, width: i32, height: i32, found: bool }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(callback: Option<unsafe extern "system" fn(*mut c_void, isize) -> i32>, data: isize) -> i32;
+        fn IsWindowVisible(window: *mut c_void) -> i32;
+        fn GetWindowThreadProcessId(window: *mut c_void, process_id: *mut u32) -> u32;
+        fn GetWindowRect(window: *mut c_void, rect: *mut Rect) -> i32;
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+
+    unsafe extern "system" fn visit(window: *mut c_void, data: isize) -> i32 {
+        let search = &mut *(data as *mut Search);
+        if IsWindowVisible(window) == 0 { return 1; }
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, &mut pid);
+        if pid != search.pid { return 1; }
+        let mut rect = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+        if GetWindowRect(window, &mut rect) == 0 { return 1; }
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if width >= search.width * 4 / 5 && height >= search.height * 3 / 4 {
+            search.found = true;
+            return 0;
+        }
+        1
+    }
+
+    let width = unsafe { GetSystemMetrics(0) };
+    let height = unsafe { GetSystemMetrics(1) };
+    if process_id == 0 || width <= 0 || height <= 0 { return false; }
+    let mut search = Search { pid: process_id, width, height, found: false };
+    unsafe { EnumWindows(Some(visit), (&mut search as *mut Search) as isize); }
+    search.found
+}
+
+#[cfg(windows)]
+fn has_game_sized_window(process_id: u32) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<u32, (Instant, bool)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(entries) = cache.lock() {
+        if let Some((checked, found)) = entries.get(&process_id) {
+            if checked.elapsed() < Duration::from_secs(2) { return *found; }
+        }
+    }
+    let found = has_game_sized_window_uncached(process_id);
+    if let Ok(mut entries) = cache.lock() {
+        if entries.len() > 256 {
+            entries.retain(|_, (checked, _)| checked.elapsed() < Duration::from_secs(60));
+        }
+        entries.insert(process_id, (Instant::now(), found));
+    }
+    found
+}
+
+#[cfg(not(windows))]
+fn has_game_sized_window(_process_id: u32) -> bool { false }
+
+fn is_game_candidate(application: &str, process_id: u32) -> bool {
     let name = application
         .rsplit(['\\', '/'])
         .next()
@@ -239,6 +582,7 @@ fn is_game_candidate(application: &str) -> bool {
     known_games.contains(&name.as_str())
         || name.contains("shipping.exe")
         || name.contains("client-win")
+        || has_game_sized_window(process_id)
 }
 
 fn start_presentmon(metrics: Arc<Mutex<GameMetrics>>, executable: PathBuf) {
@@ -284,7 +628,8 @@ fn start_presentmon(metrics: Arc<Mutex<GameMetrics>>, executable: PathBuf) {
 
                 let application = fields[0].trim();
 
-                if !is_game_candidate(application) {
+                let process_id = fields.get(1).and_then(|value| value.trim().parse::<u32>().ok()).unwrap_or(0);
+                if !is_game_candidate(application, process_id) {
                     continue;
                 }
 
@@ -701,6 +1046,10 @@ fn start_network_monitor(metrics: Arc<Mutex<NetworkMetrics>>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let pc_state = PcState {
+        system: Mutex::new(System::new()),
+    };
+
     let game_state = GameState {
         metrics: Arc::new(Mutex::new(GameMetrics::default())),
     };
@@ -714,6 +1063,7 @@ pub fn run() {
     let network_metrics = Arc::clone(&network_state.metrics);
 
     tauri::Builder::default()
+        .manage(pc_state)
         .manage(game_state)
         .manage(network_state)
         .setup(move |app| {
@@ -721,24 +1071,46 @@ pub fn run() {
                 app.path()
                     .resource_dir()
                     .ok()
-                    .map(|dir| dir.join("PresentMon-2.6.0-x64.exe"))
+                    .map(|dir| dir.join("PresentMon-2.5.1-x64.exe"))
                     .filter(|path| path.exists())
             });
 
             if let Some(executable) = executable {
                 start_presentmon(game_metrics, executable);
             } else {
-                eprintln!("PresentMon-2.6.0-x64.exe не найден");
+                eprintln!("PresentMon-2.5.1-x64.exe не найден");
             }
 
             start_network_monitor(network_metrics);
+
+            #[cfg(windows)]
+            register_insert_hotkey(app.handle().clone());
+
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_always_on_top(true);
+                if std::env::args().any(|arg| arg == "--background") {
+                    let _ = window.hide();
+                }
+            }
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_pc_metrics,
             get_game_metrics,
-            get_network_metrics
+            get_network_metrics,
+            get_media_session,
+            control_media,
+            adjust_system_volume,
+            get_start_on_login,
+            set_start_on_login,
+            get_discord_config,
+            save_discord_credentials,
+            connect_discord,
+            get_discord_voice_status,
+            control_discord,
+            disconnect_discord,
+            forget_discord_credentials
         ])
         .run(tauri::generate_context!())
         .expect("error while running NEXUS");

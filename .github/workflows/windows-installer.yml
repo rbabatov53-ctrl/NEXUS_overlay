@@ -1,0 +1,45 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - arena/72c51e07-nexus-overlay
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          & npm run build:windows *> build.log
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -ne 0) {
+            $diagnostics = Select-String -Path build.log -Pattern '(^|\s)error(\[[A-Z0-9]+\])?:|cannot find|no method named|type annotations needed|failed to run custom build command|did not exit successfully' -Context 1, 2 | ForEach-Object { $_.ToString() }
+            if (-not $diagnostics) { $diagnostics = Get-Content build.log -Tail 80 }
+            $message = ($diagnostics -join "`n")
+            if ($message.Length -gt 5000) { $message = $message.Substring($message.Length - 5000) }
+            $message = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows build diagnostics::$message"
+            Get-Content build.log -Tail 80
+          }
+          exit $buildExit
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-Overlay-Windows-Installer
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          compression-level: 0
