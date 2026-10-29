@@ -74,11 +74,6 @@ mod windows_rpc {
         fn CredDeleteW(target: *const u16, credential_type: u32, flags: u32) -> i32;
     }
 
-    #[link(name = "user32")]
-    extern "system" {
-        fn keybd_event(vk: u8, scan: u8, flags: u32, extra_info: usize);
-    }
-
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -342,29 +337,6 @@ mod windows_rpc {
         save_credentials(&credentials)
     }
 
-    pub fn store(app_id: String, secret: String, redirect_uri: String) -> Result<(), String> {
-        let app_id = app_id.trim().to_string();
-        let secret = secret.trim().to_string();
-        let redirect_uri = redirect_uri.trim().to_string();
-        if app_id.is_empty() || secret.is_empty() || redirect_uri.is_empty() {
-            return Err("Discord Application ID, Client Secret and Redirect URI are required".into());
-        }
-        if !app_id.chars().all(|c| c.is_ascii_digit()) { return Err("Discord Application ID must contain digits only".into()); }
-        if !(redirect_uri.starts_with("https://") || redirect_uri.starts_with("http://localhost")) {
-            return Err("Use the exact HTTPS or localhost redirect URI registered in Developer Portal".into());
-        }
-        save_credentials(&StoredCredentials {
-            app_id,
-            client_secret: secret,
-            redirect_uri,
-            access_token: None,
-            refresh_token: None,
-            expires_at: 0,
-        })
-    }
-
-    pub fn has_credentials() -> bool { load_credentials().is_ok() }
-
     pub fn forget() -> Result<(), String> {
         let target = super::CREDENTIAL_TARGET.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
         if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
@@ -387,7 +359,6 @@ mod platform {
     pub fn status() -> Result<VoiceStatus, String> { Err("Discord RPC is available in the Windows app".into()) }
     pub fn control(_: &str) -> Result<VoiceStatus, String> { Err("Discord RPC is available in the Windows app".into()) }
     pub fn disconnect() -> Result<(), String> { Err("Discord RPC is available in the Windows app".into()) }
-    pub fn has_credentials() -> bool { false }
     pub fn forget() -> Result<(), String> { Ok(()) }
 }
 
@@ -397,5 +368,4 @@ pub fn connect() -> Result<VoiceStatus, String> { platform::connect() }
 pub fn status() -> Result<VoiceStatus, String> { platform::status() }
 pub fn control(action: &str) -> Result<VoiceStatus, String> { platform::control(action) }
 pub fn disconnect() -> Result<(), String> { platform::disconnect() }
-pub fn has_credentials() -> bool { platform::has_credentials() }
 pub fn forget() -> Result<(), String> { platform::forget() }
