@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/PresentMon-*.exe
+*.pdb
+*.zip
+.env
+.env.*
+!.env.example
